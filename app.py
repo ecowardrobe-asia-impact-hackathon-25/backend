@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import pickle
 from io import BytesIO
 from typing import Any, Dict, List
 
@@ -11,6 +12,13 @@ import PIL.Image
 
 from google import genai
 from google.genai import types
+
+# Additional imports for mix-match algorithm
+import torch
+import torchvision.transforms as transforms
+from torchvision import models
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -23,10 +31,13 @@ if not credentials_path or not API_KEY:
     logging.error("Missing required environment variables: GOOGLE_APPLICATION_CREDENTIALS or GEMINI_API_KEY")
     raise EnvironmentError("Missing required environment variables.")
 
-# Initialize clients
+# Initialize Google Cloud Vision & Gemini clients
 vision_client = vision.ImageAnnotatorClient()
 genai_client = genai.Client(api_key=API_KEY)
 
+# -----------------------------
+# Gemini and Vision Functions
+# -----------------------------
 def clean_response_text(text: str) -> str:
     """
     Remove markdown code block delimiters (```) from the response text.
@@ -101,7 +112,6 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
     )
 
     logging.info(f"GenAI raw response: {response.text}")
-
     raw_text = clean_response_text(response.text)
     if not raw_text:
         raise ValueError("Empty response from Gemini API.")
@@ -113,11 +123,86 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
 
     return metrics
 
+# -----------------------------
+# Mix-Match Recommendation Setup
+# -----------------------------
+# Load pretrained ResNet model for feature extraction
+resnet_model = models.resnet18()
+resnet_model.load_state_dict(torch.load("resnet18-f37072fd.pth"))
+resnet_model = torch.nn.Sequential(*list(resnet_model.children())[:-1])  # Remove final layer
+resnet_model.eval()
+
+def extract_features(image: PIL.Image.Image) -> np.ndarray:
+    """
+    Extract features from an image using the pretrained ResNet model.
+    """
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    image_tensor = transform(image).unsqueeze(0)
+    with torch.no_grad():
+        features = resnet_model(image_tensor)
+    return features.squeeze().numpy()
+
+# Set folder and file names for candidate images
+TEST_IMAGES_FOLDER = "test_image"
+EMBEDDINGS_FILE = "test_images_embeddings.pkl"
+
+# Load or compute embeddings for all images in test_images folder
+if os.path.exists(EMBEDDINGS_FILE):
+    try:
+        with open(EMBEDDINGS_FILE, "rb") as f:
+            stored_embeddings, image_paths = pickle.load(f)
+        logging.info(f"Loaded {len(image_paths)} embeddings from {EMBEDDINGS_FILE}")
+    except Exception as e:
+        logging.warning(f"Error loading embeddings: {e}. Recomputing...")
+        stored_embeddings, image_paths = [], []
+else:
+    stored_embeddings, image_paths = [], []
+
+if not image_paths:
+    # List all image files in the test_images folder (non-recursive)
+    image_paths = [os.path.join(TEST_IMAGES_FOLDER, f) for f in os.listdir(TEST_IMAGES_FOLDER)
+                   if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    for path in image_paths:
+        try:
+            img = PIL.Image.open(path).convert("RGB")
+            feat = extract_features(img)
+            stored_embeddings.append(feat)
+        except Exception as e:
+            logging.warning(f"Error processing {path}: {e}")
+    stored_embeddings = np.array(stored_embeddings)
+    # Save embeddings for faster loading in future runs
+    try:
+        with open(EMBEDDINGS_FILE, "wb") as f:
+            pickle.dump((stored_embeddings, image_paths), f)
+        logging.info(f"Saved embeddings to {EMBEDDINGS_FILE}")
+    except Exception as e:
+        logging.warning(f"Could not save embeddings: {e}")
+
+def get_similar_items(uploaded_embedding: np.ndarray, top_n: int = 3) -> List[str]:
+    """
+    Find and return paths of top_n similar images from the test_images folder.
+    """
+    if uploaded_embedding.ndim == 1:
+        uploaded_embedding = uploaded_embedding.reshape(1, -1)
+    knn = NearestNeighbors(n_neighbors=min(top_n, len(stored_embeddings)), metric="cosine")
+    knn.fit(stored_embeddings)
+    distances, indices = knn.kneighbors(uploaded_embedding)
+    similar_paths = [image_paths[i] for i in indices[0]]
+    return similar_paths
+
+# -----------------------------
+# Flask App Setup
+# -----------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Enhanced Google Vision & Gemini Fashion Backend is running."
+    return "Enhanced Google Vision, Gemini & Mix-Match Fashion Backend is running."
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
@@ -125,7 +210,8 @@ def upload_image():
     1. Receives an image file via POST (multipart/form-data).
     2. Uses Google Cloud Vision API for label detection.
     3. Calls Gemini to compute sustainability metrics and additional clothing information.
-    4. Returns a JSON response containing both the detected labels and generated metrics.
+    4. Uses a mix-match algorithm (via ResNet feature extraction) to find similar items from the test_images folder.
+    5. Returns a JSON response containing both the detected labels, Gemini metrics, and matching items.
     """
     if 'file' not in request.files:
         return jsonify({'error': 'No file part in the request'}), 400
@@ -140,7 +226,7 @@ def upload_image():
         logging.error(f"Error reading file: {e}")
         return jsonify({'error': 'Failed to read image file'}), 500
 
-    # Label detection using Google Cloud Vision
+    # 1. Label detection using Google Cloud Vision
     try:
         image = vision.Image(content=image_content)
         vision_response = vision_client.label_detection(image=image)
@@ -153,21 +239,35 @@ def upload_image():
         {'description': label.description, 'score': label.score} for label in labels
     ]
 
+    # 2. Compute sustainability metrics with Gemini
     try:
         metrics = compute_metrics_with_genai(detected_labels, image_content)
     except Exception as e:
         logging.error(f"Gemini call failed: {e}")
         return jsonify({"error": f"Gemini call failed: {str(e)}"}), 500
 
+    # 3. Mix-Match: Extract features from uploaded image and find similar items
+    try:
+        pil_image = PIL.Image.open(BytesIO(image_content)).convert("RGB")
+        uploaded_embedding = extract_features(pil_image)
+        matching_items = get_similar_items(uploaded_embedding, top_n=3)
+    except Exception as e:
+        logging.error(f"Mix-match processing failed: {e}")
+        matching_items = []
+
+    # Build the combined response
     response_data = {
         'labels': detected_labels,
-        'clothingType': metrics.get('clothingType', 'Unknown'),
-        'material': metrics.get('material', 'Unknown'),
-        'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
-        'longevityScore': metrics.get('longevityScore', 0),
-        'co2Consumption': metrics.get('co2Consumption', 0),
-        'sustainabilityScore': metrics.get('sustainabilityScore', 0),
-        'maintenanceTips': metrics.get('maintenanceTips', 'No tips available')
+        'gemini': {
+            'clothingType': metrics.get('clothingType', 'Unknown'),
+            'material': metrics.get('material', 'Unknown'),
+            'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
+            'longevityScore': metrics.get('longevityScore', 0),
+            'co2Consumption': metrics.get('co2Consumption', 0),
+            'sustainabilityScore': metrics.get('sustainabilityScore', 0),
+            'maintenanceTips': metrics.get('maintenanceTips', 'No tips available')
+        },
+        'matchingItems': matching_items
     }
 
     return jsonify(response_data), 200
