@@ -9,15 +9,17 @@ elif command -v open &> /dev/null; then
   OPEN_CMD="open"
 fi
 
-for img in test_image/*.png; do
-    filename=$(basename "$img" .png)
-    output_file="${OUTPUT_DIR}/${filename}_response.json"
+for img in test_image/*.{png,jpg}; do
+  filename=$(basename "$img")
+  extension="${filename##*.}"
+  base_name="${filename%.*}"
+  output_file="${OUTPUT_DIR}/${base_name}_response.json"
 
-    curl -X POST -F "file=@${img}" http://localhost:8080/upload > "$output_file" &
+  curl -X POST -F "file=@${img}" http://localhost:8080/upload > "$output_file" &
 
-    if [ -n "$OPEN_CMD" ]; then
-        "$OPEN_CMD" "$img" &
-    fi
+  # if [ -n "$OPEN_CMD" ]; then
+  #     "$OPEN_CMD" "$img" &
+  # fi
 done
 
 wait
