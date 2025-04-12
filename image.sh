@@ -20,7 +20,6 @@ for img in test_image/*.{png,jpg}; do
   curl -X POST -F "file=@${img}" http://localhost:8080/upload > "$output_file"
   
   # Then request to /matching endpoint (using the cached data)
-  curl -X POST -F "file=@${img}" http://localhost:8080/matching > "$output_matching"
 
   # if [ -n "$OPEN_CMD" ]; then
   #     "$OPEN_CMD" "$img" &

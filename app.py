@@ -13,12 +13,11 @@ import PIL.Image
 
 from google import genai
 from google.genai import types
+import firebase_admin
+from firebase_admin import credentials, firestore
+# Initialize Firebase Admin SDK
+cred = credentials.ApplicationDefault()
 # Additional imports for mix-match algorithm
-import torch
-import torchvision.transforms as transforms
-from torchvision import models
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -34,6 +33,9 @@ if not credentials_path or not API_KEY:
 # Initialize Google Cloud Vision & Gemini clients
 vision_client = vision.ImageAnnotatorClient()
 genai_client = genai.Client(api_key=API_KEY)
+
+default_app = firebase_admin.initialize_app()
+db = firestore.client()
 
 # Define clothing categories and their matching relationships
 CLOTHING_CATEGORIES = {
@@ -257,17 +259,15 @@ def upload_image():
     
     # Build the response (without matching items)
     response_data = {
-        'labels': detected_labels,
-        'gemini': {
-            'clothingType': metrics.get('clothingType', 'Unknown'),
-            'clothingCategory': clothing_category,
-            'material': metrics.get('material', 'Unknown'),
-            'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
-            'longevityScore': metrics.get('longevityScore', 0),
-            'co2Consumption': metrics.get('co2Consumption', 0),
-            'sustainabilityScore': metrics.get('sustainabilityScore', 0),
-            'maintenanceTips': metrics.get('maintenanceTips', 'No tips available'),
-        }
+        'clothingType': metrics.get('clothingType', 'Unknown'),
+        'clothingCategory': clothing_category,
+        'material': metrics.get('material', 'Unknown'),
+        'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
+        'longevityScore': metrics.get('longevityScore', 0),
+        'co2Consumption': metrics.get('co2Consumption', 0),
+        'sustainabilityScore': metrics.get('sustainabilityScore', 0),
+        'maintenanceTips': metrics.get('maintenanceTips', 'No tips available')
+
     }
 
     return jsonify(response_data), 200
@@ -278,28 +278,35 @@ def get_matching():
     Uses the cached clothing category to return matching items
     without reprocessing the image.
     """
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part in the request'}), 400
 
-    file = request.files['file']
-    if not file or file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+    # Get item id + userId from request body
+    data = request.get_json()
+    item_id = data.get('itemId')
+    user_id = data.get('userId')
 
-    filename = file.filename
+    if not item_id or not user_id:
+        return jsonify({'error': 'itemId and userId are required'}), 400
+    # Fetch clothingItem data from firebase
+    item = db.collection('users').document(user_id).collection('wardrobeItems').document(item_id).get()
+
+    if not item.exists:
+        return jsonify({'error': 'Item not found'}), 404
+    clothingItem = item.to_dict()
+
+    # Query matching item: if clothingItem is a top, get bottom items, bottom -> top, dress -> none, limit = 3
+    clothing_category = clothingItem['clothingCategory']    
+    if clothingItem['clothingCategory'] == 'top':
+        clothing_category = 'bottom'
+    elif clothingItem['clothingCategory'] == 'bottom':
+        clothing_category = 'top'
+    else:
+        return jsonify({ 'matchingItems': [] }), 200
     
-    # Check if we have this image's category in the cache
-    if filename not in ANALYSIS_CACHE:
-        return jsonify({'error': 'Please process this image with /upload endpoint first'}), 400
-        
-    # Get the clothing category from cache
-    clothing_category = ANALYSIS_CACHE[filename]
+    matching_items = db.collection('users').document(user_id).collection('wardrobeItems').where('clothingCategory', '==', clothing_category).limit(3).get()
     
-    # Get matching items based on cached clothing category
-    matching_items = get_matching_items(clothing_category)
-   
     # Build the matching items response
     response_data = {
-        'matchingItems': matching_items
+        'matchingItems': [item.to_dict() for item in matching_items]
     }
 
     return jsonify(response_data), 200
