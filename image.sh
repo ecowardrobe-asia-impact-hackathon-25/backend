@@ -14,14 +14,17 @@ for img in test_image/*.{png,jpg}; do
   extension="${filename##*.}"
   base_name="${filename%.*}"
   output_file="${OUTPUT_DIR}/${base_name}_response.json"
+  output_matching="${OUTPUT_DIR}/${base_name}_response_matching.json"
 
-  curl -X POST -F "file=@${img}" http://localhost:8080/upload > "$output_file" &
+  # First request to /upload endpoint
+  curl -X POST -F "file=@${img}" http://localhost:8080/upload > "$output_file"
+  
+  # Then request to /matching endpoint (using the cached data)
+  curl -X POST -F "file=@${img}" http://localhost:8080/matching > "$output_matching"
 
   # if [ -n "$OPEN_CMD" ]; then
   #     "$OPEN_CMD" "$img" &
   # fi
 done
-
-wait
 
 echo "All responses have been saved in the '$OUTPUT_DIR' directory."
