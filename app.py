@@ -49,8 +49,34 @@ CATEGORY_MATCHING = {
     "dress": [],
 }
 
+def load_category_items(category: str) -> List[Dict]:
+    """Load items from a category JSON file."""
+    try:
+        with open(f"categorized_items/{category}_items.json", 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logging.warning(f"No items found for category: {category}")
+        return []
+    except json.JSONDecodeError as e:
+        logging.error(f"Error loading {category}_items.json: {e}")
+        return []
 
-
+def get_matching_items(category: str) -> List[Dict]:
+    """Get matching items based on the clothing category."""
+    matching_items = []
+    
+    # Get the categories that match with the given category
+    matching_categories = CATEGORY_MATCHING.get(category, [])
+    
+    # For each matching category, load items and select random ones
+    for match_category in matching_categories:
+        items = load_category_items(match_category)
+        if items:
+            # Select up to 3 random items
+            num_items = min(3, len(items))
+            matching_items.extend(random.sample(items, num_items))
+    
+    return matching_items
 
 # -----------------------------
 # Gemini and Vision Functions
@@ -170,163 +196,6 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
 
     return metrics
 
-def generate_outfit_ideas(clothing_type: str, clothing_category: str) -> List[Dict[str, str]]:
-    """
-    Uses Gemini to generate outfit ideas based on the clothing type and category.
-    """
-    prompt = (
-        f"Generate 3 outfit ideas that would go well with a {clothing_type} (category: {clothing_category}).\n\n"
-        "For each outfit idea, specify:\n"
-        "1. A title for the outfit (e.g., 'Casual Weekend Look', 'Office Chic')\n"
-        "2. What specific items would pair well with the {clothing_type}\n"
-        "3. A brief description of the overall style\n\n"
-        "Return the results as a valid JSON array with each object having the following structure:\n"
-        "{\n"
-        "  \"title\": \"Outfit title\",\n"
-        "  \"items\": [\"item1\", \"item2\", ...],\n"
-        "  \"description\": \"Brief style description\"\n"
-        "}\n"
-    )
-
-    response = genai_client.models.generate_content(
-        model="gemini-2.0-flash-exp",
-        contents=prompt
-    )
-
-    raw_text = clean_response_text(response.text)
-    if not raw_text:
-        logging.warning("Empty response from Gemini for outfit ideas")
-        return []
-
-    try:
-        outfit_ideas = json.loads(raw_text)
-        if not isinstance(outfit_ideas, list):
-            raise ValueError("Expected a JSON array of outfit ideas")
-        return outfit_ideas
-    except Exception as e:
-        logging.error(f"Failed to parse outfit ideas: {e}. Raw response: {raw_text}")
-        return []
-    
-# -----------------------------
-# Load pretrained ResNet model for feature extraction
-resnet_model = models.resnet18()
-resnet_model.load_state_dict(torch.load("resnet18-f37072fd.pth"))
-resnet_model = torch.nn.Sequential(*list(resnet_model.children())[:-1])  # Remove final layer
-resnet_model.eval()
-
-def extract_features(image: PIL.Image.Image) -> np.ndarray:
-    """
-    Extract features from an image using the pretrained ResNet model.
-    """
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    image_tensor = transform(image).unsqueeze(0)
-    with torch.no_grad():
-        features = resnet_model(image_tensor)
-    return features.squeeze().numpy()
-
-# Set folder and file names for candidate images
-TEST_IMAGES_FOLDER = "test_image"
-EMBEDDINGS_FILE = "test_images_embeddings.pkl"
-
-# Load or compute embeddings for all images in test_images folder
-if os.path.exists(EMBEDDINGS_FILE):
-    try:
-        with open(EMBEDDINGS_FILE, "rb") as f:
-            stored_embeddings, image_paths, stored_metadata = pickle.load(f)
-        logging.info(f"Loaded {len(image_paths)} embeddings and metadata from {EMBEDDINGS_FILE}")
-    except Exception as e:
-        logging.warning(f"Error loading embeddings: {e}. Recomputing...")
-        stored_embeddings, image_paths, stored_metadata = [], [], []
-else:
-    stored_embeddings, image_paths, stored_metadata = [], [], []
-
-if not image_paths:
-    # List all image files in the test_images folder (non-recursive)
-    image_paths = [os.path.join(TEST_IMAGES_FOLDER, f) for f in os.listdir(TEST_IMAGES_FOLDER)
-                   if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    
-    # Process each image to extract metadata and features
-    stored_metadata = []
-    for path in image_paths:
-        metadata = {}
-        filename = os.path.basename(path).lower()
-        
-        # Determine category from filename (or use Vision/Gemini in a real scenario)
-        detected_type = filename.split('.')[0].replace('_', ' ')  # Simple extraction
-        normalized_type = detected_type
-        category = 'other'
-        
-        for cat, types in CLOTHING_CATEGORIES.items():
-            for t in types:
-                if t in detected_type:
-                    normalized_type = t
-                    category = cat
-                    break
-            if category != 'other':
-                break
-
-        metadata["filename"] = filename
-        metadata["clothingType"] = normalized_type
-        metadata["clothingCategory"] = category
-        stored_metadata.append(metadata)
-
-        # Load image and extract features
-        image =  image = PIL.Image.open(path).convert("RGB")
-        features = extract_features(image)
-        stored_embeddings.append(features)
-
-    # Save the computed embeddings, image paths, and metadata
-    with open(EMBEDDINGS_FILE, "wb") as f:
-        pickle.dump((stored_embeddings, image_paths, stored_metadata), f)
-    logging.info(f"Saved {len(image_paths)} embeddings and metadata to {EMBEDDINGS_FILE}")
-
-def get_matching_items(clothing_type: str, clothing_category: str, uploaded_embedding: np.ndarray = None, top_n: int = 3) -> List[Dict[str, Any]]:
-    # Determine target category to match
-    target_category = None
-    if clothing_category == 'top':
-        target_category = 'bottom'
-    elif clothing_category == 'bottom':
-        target_category = 'top'
-    elif clothing_category == 'dress':
-        return []
-    else:
-        return []  # No matching for 'other' categories
-    
-    # Find items in target category using precomputed metadata
-    matches = []
-    for idx, meta in enumerate(stored_metadata):
-        if meta['clothingCategory'] == target_category:
-            matches.append((idx, image_paths[idx], meta))
-    
-    # If no category matches, return empty
-    if not matches:
-        return []
-    
-    # Combine visual similarity with category match
-    match_indices = [idx for idx, _, _ in matches]
-    match_embeddings = stored_embeddings[match_indices]
-    
-    # Compute similarity scores
-    knn = NearestNeighbors(n_neighbors=min(len(matches), top_n), metric='cosine')
-    knn.fit(match_embeddings)
-    distances, indices = knn.kneighbors(uploaded_embedding.reshape(1, -1))
-    
-    # Prepare results
-    results = []
-    for i in indices[0]:
-        idx = match_indices[i]
-        results.append({
-            'path': image_paths[idx],
-            'metadata': stored_metadata[idx],
-            'similarity': 1 - distances[0][i]
-        })
-    
-    return sorted(results, key=lambda x: x['similarity'], reverse=True)[:top_n]
 # -----------------------------
 # Flask App Setup
 # -----------------------------
@@ -378,19 +247,10 @@ def upload_image():
         logging.error(f"Gemini call failed: {e}")
         return jsonify({"error": f"Gemini call failed: {str(e)}"}), 500
 
-    # 3. Mix-Match: Extract features from uploaded image and find similar items
-    try:
-        pil_image = PIL.Image.open(BytesIO(image_content)).convert("RGB")
-        uploaded_embedding = extract_features(pil_image)
-        matching_items = get_matching_items(
-            metrics['clothingType'],
-            metrics['clothingCategory'],
-            uploaded_embedding
-        )
-    except Exception as e:
-        logging.error(f"Mix-match processing failed: {e}")
-        matching_items = []
-
+    # 3. Get matching items based on clothing category
+    clothing_category = metrics.get('clothingCategory', 'Unknown')
+    matching_items = get_matching_items(clothing_category)
+   
     # Build the combined response
     response_data = {
         'labels': detected_labels,
@@ -402,7 +262,7 @@ def upload_image():
             'longevityScore': metrics.get('longevityScore', 0),
             'co2Consumption': metrics.get('co2Consumption', 0),
             'sustainabilityScore': metrics.get('sustainabilityScore', 0),
-            'maintenanceTips': metrics.get('maintenanceTips', 'No tips available')
+            'maintenanceTips': metrics.get('maintenanceTips', 'No tips available'),
         },
         'matchingItems': matching_items
     }
