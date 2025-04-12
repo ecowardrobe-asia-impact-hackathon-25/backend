@@ -49,41 +49,7 @@ CATEGORY_MATCHING = {
     "dress": [],
 }
 
-# Mapping to normalize specific clothing types to general categories
-CLOTHING_TYPE_MAPPING = {
-    # Tops
-    "active shirt": "shirt",
-    "athletic shirt": "shirt",
-    "polo shirt": "shirt",
-    "button-up shirt": "shirt",
-    "t-shirt": "shirt",
-    "tank top": "shirt",
-    "sweater": "sweater",
-    "hoodie": "hoodie",
-    "blouse": "blouse",
-    "jacket": "jacket",
-    "blazer": "blazer",
-    "cardigan": "cardigan",
-    
-    # Bottoms
-    "jeans": "jeans",
-    "denim": "jeans",
-    "pants": "pants",
-    "trousers": "pants",
-    "chinos": "pants",
-    "shorts": "shorts",
-    "skirt": "skirt",
-    "leggings": "leggings",
-    
-    # Dresses
-    "day dress": "dress",
-    "evening dress": "dress",
-    "cocktail dress": "dress",
-    "maxi dress": "dress",
-    "sundress": "dress",
-    "gown": "dress",
 
-}
 
 
 # -----------------------------
@@ -179,21 +145,28 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
         raise ValueError(f"Failed to parse Gemini response: {e}. Raw response: {raw_text}")
 
     # Normalize the clothing type if it exists in our mapping
+    # In compute_metrics_with_genai:
     if 'clothingType' in metrics:
         original_type = metrics['clothingType'].lower()
-        metrics['clothingTypeOriginal'] = original_type
-        metrics['clothingType'] = CLOTHING_TYPE_MAPPING.get(original_type, original_type)
-
-    # If clothing category isn't provided, try to derive it
-    if 'clothingCategory' not in metrics and 'clothingType' in metrics:
-        normalized_type = metrics['clothingType'].lower()
+        normalized_type = original_type
+        
+        # Check each category's types to find the most specific match
         for category, types in CLOTHING_CATEGORIES.items():
-            if any(t in normalized_type for t in types):
+            for t in types:
+                if t in normalized_type:
+                    normalized_type = t
+                    break  # Use the first match
+            if normalized_type != original_type:
+                break
+        
+        metrics['clothingType'] = normalized_type
+        # Determine category based on normalized type
+        for category, types in CLOTHING_CATEGORIES.items():
+            if any(t == normalized_type for t in types):
                 metrics['clothingCategory'] = category
                 break
-        # Default to "other" if no category is found
-        if 'clothingCategory' not in metrics:
-            metrics['clothingCategory'] = "other"
+        else:
+            metrics['clothingCategory'] = 'other'
 
     return metrics
 
@@ -264,128 +237,96 @@ EMBEDDINGS_FILE = "test_images_embeddings.pkl"
 if os.path.exists(EMBEDDINGS_FILE):
     try:
         with open(EMBEDDINGS_FILE, "rb") as f:
-            stored_embeddings, image_paths = pickle.load(f)
-        logging.info(f"Loaded {len(image_paths)} embeddings from {EMBEDDINGS_FILE}")
+            stored_embeddings, image_paths, stored_metadata = pickle.load(f)
+        logging.info(f"Loaded {len(image_paths)} embeddings and metadata from {EMBEDDINGS_FILE}")
     except Exception as e:
         logging.warning(f"Error loading embeddings: {e}. Recomputing...")
-        stored_embeddings, image_paths = [], []
+        stored_embeddings, image_paths, stored_metadata = [], [], []
 else:
-    stored_embeddings, image_paths = [], []
+    stored_embeddings, image_paths, stored_metadata = [], [], []
 
 if not image_paths:
     # List all image files in the test_images folder (non-recursive)
     image_paths = [os.path.join(TEST_IMAGES_FOLDER, f) for f in os.listdir(TEST_IMAGES_FOLDER)
                    if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    
+    # Process each image to extract metadata and features
+    stored_metadata = []
     for path in image_paths:
-        try:
-            img = PIL.Image.open(path).convert("RGB")
-            feat = extract_features(img)
-            stored_embeddings.append(feat)
-        except Exception as e:
-            logging.warning(f"Error processing {path}: {e}")
-    stored_embeddings = np.array(stored_embeddings)
-    # Save embeddings for faster loading in future runs
-    try:
-        with open(EMBEDDINGS_FILE, "wb") as f:
-            pickle.dump((stored_embeddings, image_paths), f)
-        logging.info(f"Saved embeddings to {EMBEDDINGS_FILE}")
-    except Exception as e:
-        logging.warning(f"Could not save embeddings: {e}")
+        metadata = {}
+        filename = os.path.basename(path).lower()
+        
+        # Determine category from filename (or use Vision/Gemini in a real scenario)
+        detected_type = filename.split('.')[0].replace('_', ' ')  # Simple extraction
+        normalized_type = detected_type
+        category = 'other'
+        
+        for cat, types in CLOTHING_CATEGORIES.items():
+            for t in types:
+                if t in detected_type:
+                    normalized_type = t
+                    category = cat
+                    break
+            if category != 'other':
+                break
 
-def get_matching_items(clothing_type: str, clothing_category: str, uploaded_embedding: np.ndarray = None, 
-                      top_n: int = 3, similarity_weight: float = 0.3) -> List[Dict[str, Any]]:
-    """
-    Find matching clothing items that go well with the uploaded item.
+        metadata["filename"] = filename
+        metadata["clothingType"] = normalized_type
+        metadata["clothingCategory"] = category
+        stored_metadata.append(metadata)
+
+        # Load image and extract features
+        image =  image = PIL.Image.open(path).convert("RGB")
+        features = extract_features(image)
+        stored_embeddings.append(features)
+
+    # Save the computed embeddings, image paths, and metadata
+    with open(EMBEDDINGS_FILE, "wb") as f:
+        pickle.dump((stored_embeddings, image_paths, stored_metadata), f)
+    logging.info(f"Saved {len(image_paths)} embeddings and metadata to {EMBEDDINGS_FILE}")
+
+def get_matching_items(clothing_type: str, clothing_category: str, uploaded_embedding: np.ndarray = None, top_n: int = 3) -> List[Dict[str, Any]]:
+    # Determine target category to match
+    target_category = None
+    if clothing_category == 'top':
+        target_category = 'bottom'
+    elif clothing_category == 'bottom':
+        target_category = 'top'
+    elif clothing_category == 'dress':
+        return []
+    else:
+        return []  # No matching for 'other' categories
     
-    This function uses both:
-    1. Category-based matching (e.g., tops match with bottoms)
-    2. Visual similarity (if embedding is provided)
+    # Find items in target category using precomputed metadata
+    matches = []
+    for idx, meta in enumerate(stored_metadata):
+        if meta['clothingCategory'] == target_category:
+            matches.append((idx, image_paths[idx], meta))
     
-    Returns a list of dictionaries with path and metadata for each matching item.
-    """
-    # Step 0: Check if category is dress and return empty list
-    if clothing_category.lower() == 'dress':
+    # If no category matches, return empty
+    if not matches:
         return []
     
-    matching_items = []
+    # Combine visual similarity with category match
+    match_indices = [idx for idx, _, _ in matches]
+    match_embeddings = stored_embeddings[match_indices]
     
-    # Step 1: Find all items in matching categories
-    if clothing_category in CATEGORY_MATCHING:
-        matching_categories = CATEGORY_MATCHING[clothing_category]
-        category_matches = []
-        
-        # Use image_paths and stored_embeddings from TEST_IMAGES_FOLDER
-        for idx, path in enumerate(image_paths):
-            # Get metadata for the image - you may need to adjust how you access metadata
-            # Assuming there's a way to get metadata for each path
-            item_metadata = {}  # Replace with actual metadata access
-            item_category = item_metadata.get('clothingCategory', 'other')
-            
-            if item_category in matching_categories:
-                category_matches.append((idx, path, item_metadata))
-        
-        # Step 2: If we have an embedding, compute similarity scores
-        if uploaded_embedding is not None and len(category_matches) > 0:
-            # Extract indices of category matches
-            match_indices = [idx for idx, _, _ in category_matches]
-            match_embeddings = np.array([stored_embeddings[idx] for idx in match_indices])
-            
-            # Compute similarity scores
-            knn = NearestNeighbors(n_neighbors=min(len(match_embeddings), top_n*2), metric="cosine")
-            knn.fit(match_embeddings)
-            distances, indices = knn.kneighbors(uploaded_embedding.reshape(1, -1))
-            
-            # Get the top visually similar items from category matches
-            for i in range(min(len(indices[0]), top_n*2)):
-                idx = match_indices[indices[0][i]]
-                path = image_paths[idx]
-                # Get metadata for this path
-                metadata = {}  # Replace with actual metadata access
-                matching_items.append({
-                    'path': path,
-                    'metadata': metadata,
-                    'matchType': 'visual+category',
-                    'similarityScore': float(1.0 - distances[0][i])  # Convert distance to similarity score
-                })
-        
-        # Step 3: If we don't have enough visually similar items, add random category matches
-        if len(matching_items) < top_n and category_matches:
-            random.shuffle(category_matches)
-            for _, path, metadata in category_matches:
-                if len(matching_items) >= top_n:
-                    break
-                    
-                # Check if this item is already in the list
-                if not any(item['path'] == path for item in matching_items):
-                    matching_items.append({
-                        'path': path,
-                        'metadata': metadata,
-                        'matchType': 'category',
-                        'similarityScore': 0.0
-                    })
+    # Compute similarity scores
+    knn = NearestNeighbors(n_neighbors=min(len(matches), top_n), metric='cosine')
+    knn.fit(match_embeddings)
+    distances, indices = knn.kneighbors(uploaded_embedding.reshape(1, -1))
     
-    # Step 4: If we still don't have enough items, add some random ones
-    if len(matching_items) < top_n and image_paths:
-        random_indices = random.sample(range(len(image_paths)), min(top_n*2, len(image_paths)))
-        for idx in random_indices:
-            path = image_paths[idx]
-            # Get metadata for this path
-            metadata = {}  # Replace with actual metadata access
-            
-            # Check if this item is already in the list
-            if len(matching_items) >= top_n:
-                break
-            if not any(item['path'] == path for item in matching_items):
-                matching_items.append({
-                    'path': path,
-                    'metadata': metadata,
-                    'matchType': 'random',
-                    'similarityScore': 0.0
-                })
+    # Prepare results
+    results = []
+    for i in indices[0]:
+        idx = match_indices[i]
+        results.append({
+            'path': image_paths[idx],
+            'metadata': stored_metadata[idx],
+            'similarity': 1 - distances[0][i]
+        })
     
-    # Return top_n matching items
-    return matching_items[:top_n]
-
+    return sorted(results, key=lambda x: x['similarity'], reverse=True)[:top_n]
 # -----------------------------
 # Flask App Setup
 # -----------------------------
@@ -444,9 +385,7 @@ def upload_image():
         matching_items = get_matching_items(
             metrics['clothingType'],
             metrics['clothingCategory'],
-            uploaded_embedding=uploaded_embedding,
-            top_n=3,
-            similarity_weight=0.3
+            uploaded_embedding
         )
     except Exception as e:
         logging.error(f"Mix-match processing failed: {e}")
@@ -457,6 +396,7 @@ def upload_image():
         'labels': detected_labels,
         'gemini': {
             'clothingType': metrics.get('clothingType', 'Unknown'),
+            'clothingCategory': metrics.get('clothingCategory', 'Unknown'),
             'material': metrics.get('material', 'Unknown'),
             'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
             'longevityScore': metrics.get('longevityScore', 0),
