@@ -2,8 +2,9 @@ import os
 import json
 import logging
 import pickle
+import random
 from io import BytesIO
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from flask import Flask, request, jsonify
 from google.cloud import vision
@@ -12,7 +13,6 @@ import PIL.Image
 
 from google import genai
 from google.genai import types
-
 # Additional imports for mix-match algorithm
 import torch
 import torchvision.transforms as transforms
@@ -34,6 +34,57 @@ if not credentials_path or not API_KEY:
 # Initialize Google Cloud Vision & Gemini clients
 vision_client = vision.ImageAnnotatorClient()
 genai_client = genai.Client(api_key=API_KEY)
+
+# Define clothing categories and their matching relationships
+CLOTHING_CATEGORIES = {
+    "top": ["shirt", "blouse", "t-shirt", "sweater", "hoodie", "tank top", "polo", "jacket", "blazer", "cardigan"],
+    "bottom": ["pants", "jeans", "shorts", "skirt", "trousers", "leggings"],
+    "dress": ["dress", "gown", "sundress", "maxi dress"],
+}
+
+# Define which categories match with each other
+CATEGORY_MATCHING = {
+    "top": ["bottom"],
+    "bottom": ["top"],
+    "dress": [],
+}
+
+# Mapping to normalize specific clothing types to general categories
+CLOTHING_TYPE_MAPPING = {
+    # Tops
+    "active shirt": "shirt",
+    "athletic shirt": "shirt",
+    "polo shirt": "shirt",
+    "button-up shirt": "shirt",
+    "t-shirt": "shirt",
+    "tank top": "shirt",
+    "sweater": "sweater",
+    "hoodie": "hoodie",
+    "blouse": "blouse",
+    "jacket": "jacket",
+    "blazer": "blazer",
+    "cardigan": "cardigan",
+    
+    # Bottoms
+    "jeans": "jeans",
+    "denim": "jeans",
+    "pants": "pants",
+    "trousers": "pants",
+    "chinos": "pants",
+    "shorts": "shorts",
+    "skirt": "skirt",
+    "leggings": "leggings",
+    
+    # Dresses
+    "day dress": "dress",
+    "evening dress": "dress",
+    "cocktail dress": "dress",
+    "maxi dress": "dress",
+    "sundress": "dress",
+    "gown": "dress",
+
+}
+
 
 # -----------------------------
 # Gemini and Vision Functions
@@ -69,9 +120,11 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
     prompt = (
         "Based on the following detected fashion labels: "
         f"{json.dumps(labels)}, and using these benchmark guidelines:\n\n"
-        "Clothing Type and Material:\n"
-        "  - Identify the clothing type (e.g., dress, shirt, pants) from the provided labels.\n"
-        "  - Infer the primary material or fabric if possible (e.g., cotton, polyester, wool).\n\n"
+        "Clothing Type and Category:\n"
+        "  - Identify the specific clothing type (e.g., t-shirt, jeans, dress)\n"
+        "  - Determine the general clothing category from these options: top, bottom, dress\n\n"
+        "Material:\n"
+        "  - Infer the primary material or fabric if possible (e.g., cotton, polyester, wool)\n\n"
         "Fabric Composition Score (0–10):\n"
         "  - 8–10 for organic or recycled fibers (e.g., organic cotton)\n"
         "  - 5–7 for natural fibers (e.g., regular cotton, wool)\n"
@@ -87,7 +140,8 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
         "Overall Sustainability Score (0–10):\n"
         "  - Weighted average: 40% fabric, 30% longevity, 30% CO₂ (after normalization)\n\n"
         "Please provide a detailed analysis in JSON format with the following keys:\n"
-        "  - clothingType (string),\n"
+        "  - clothingType (string, e.g., 't-shirt', 'jeans'),\n"
+        "  - clothingCategory (string, one of: top, bottom, dress),\n"
         "  - material (string),\n"
         "  - fabricComposition (string description),\n"
         "  - longevityScore (numeric value 0–10),\n"
@@ -99,10 +153,13 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
 
     # Prepare image representations for Gemini
     pil_image = PIL.Image.open(BytesIO(image_content))
-    b64_image = types.Part.from_bytes(
+    
+    # Fix: Use the properly imported genai.types namespace
+    b64_image = genai.types.Part.from_bytes(
         data=image_content,
         mime_type="image/jpeg"
     )
+    
     # Gemini will consider both the text prompt and the image inputs.
     contents = [prompt, pil_image, b64_image]
 
@@ -121,10 +178,62 @@ def compute_metrics_with_genai(labels: List[Dict[str, Any]], image_content: byte
     except Exception as e:
         raise ValueError(f"Failed to parse Gemini response: {e}. Raw response: {raw_text}")
 
+    # Normalize the clothing type if it exists in our mapping
+    if 'clothingType' in metrics:
+        original_type = metrics['clothingType'].lower()
+        metrics['clothingTypeOriginal'] = original_type
+        metrics['clothingType'] = CLOTHING_TYPE_MAPPING.get(original_type, original_type)
+
+    # If clothing category isn't provided, try to derive it
+    if 'clothingCategory' not in metrics and 'clothingType' in metrics:
+        normalized_type = metrics['clothingType'].lower()
+        for category, types in CLOTHING_CATEGORIES.items():
+            if any(t in normalized_type for t in types):
+                metrics['clothingCategory'] = category
+                break
+        # Default to "other" if no category is found
+        if 'clothingCategory' not in metrics:
+            metrics['clothingCategory'] = "other"
+
     return metrics
 
-# -----------------------------
-# Mix-Match Recommendation Setup
+def generate_outfit_ideas(clothing_type: str, clothing_category: str) -> List[Dict[str, str]]:
+    """
+    Uses Gemini to generate outfit ideas based on the clothing type and category.
+    """
+    prompt = (
+        f"Generate 3 outfit ideas that would go well with a {clothing_type} (category: {clothing_category}).\n\n"
+        "For each outfit idea, specify:\n"
+        "1. A title for the outfit (e.g., 'Casual Weekend Look', 'Office Chic')\n"
+        "2. What specific items would pair well with the {clothing_type}\n"
+        "3. A brief description of the overall style\n\n"
+        "Return the results as a valid JSON array with each object having the following structure:\n"
+        "{\n"
+        "  \"title\": \"Outfit title\",\n"
+        "  \"items\": [\"item1\", \"item2\", ...],\n"
+        "  \"description\": \"Brief style description\"\n"
+        "}\n"
+    )
+
+    response = genai_client.models.generate_content(
+        model="gemini-2.0-flash-exp",
+        contents=prompt
+    )
+
+    raw_text = clean_response_text(response.text)
+    if not raw_text:
+        logging.warning("Empty response from Gemini for outfit ideas")
+        return []
+
+    try:
+        outfit_ideas = json.loads(raw_text)
+        if not isinstance(outfit_ideas, list):
+            raise ValueError("Expected a JSON array of outfit ideas")
+        return outfit_ideas
+    except Exception as e:
+        logging.error(f"Failed to parse outfit ideas: {e}. Raw response: {raw_text}")
+        return []
+    
 # -----------------------------
 # Load pretrained ResNet model for feature extraction
 resnet_model = models.resnet18()
@@ -183,17 +292,99 @@ if not image_paths:
     except Exception as e:
         logging.warning(f"Could not save embeddings: {e}")
 
-def get_similar_items(uploaded_embedding: np.ndarray, top_n: int = 3) -> List[str]:
+def get_matching_items(clothing_type: str, clothing_category: str, uploaded_embedding: np.ndarray = None, 
+                      top_n: int = 3, similarity_weight: float = 0.3) -> List[Dict[str, Any]]:
     """
-    Find and return paths of top_n similar images from the test_images folder.
+    Find matching clothing items that go well with the uploaded item.
+    
+    This function uses both:
+    1. Category-based matching (e.g., tops match with bottoms)
+    2. Visual similarity (if embedding is provided)
+    
+    Returns a list of dictionaries with path and metadata for each matching item.
     """
-    if uploaded_embedding.ndim == 1:
-        uploaded_embedding = uploaded_embedding.reshape(1, -1)
-    knn = NearestNeighbors(n_neighbors=min(top_n, len(stored_embeddings)), metric="cosine")
-    knn.fit(stored_embeddings)
-    distances, indices = knn.kneighbors(uploaded_embedding)
-    similar_paths = [image_paths[i] for i in indices[0]]
-    return similar_paths
+    # Step 0: Check if category is dress and return empty list
+    if clothing_category.lower() == 'dress':
+        return []
+    
+    matching_items = []
+    
+    # Step 1: Find all items in matching categories
+    if clothing_category in CATEGORY_MATCHING:
+        matching_categories = CATEGORY_MATCHING[clothing_category]
+        category_matches = []
+        
+        # Use image_paths and stored_embeddings from TEST_IMAGES_FOLDER
+        for idx, path in enumerate(image_paths):
+            # Get metadata for the image - you may need to adjust how you access metadata
+            # Assuming there's a way to get metadata for each path
+            item_metadata = {}  # Replace with actual metadata access
+            item_category = item_metadata.get('clothingCategory', 'other')
+            
+            if item_category in matching_categories:
+                category_matches.append((idx, path, item_metadata))
+        
+        # Step 2: If we have an embedding, compute similarity scores
+        if uploaded_embedding is not None and len(category_matches) > 0:
+            # Extract indices of category matches
+            match_indices = [idx for idx, _, _ in category_matches]
+            match_embeddings = np.array([stored_embeddings[idx] for idx in match_indices])
+            
+            # Compute similarity scores
+            knn = NearestNeighbors(n_neighbors=min(len(match_embeddings), top_n*2), metric="cosine")
+            knn.fit(match_embeddings)
+            distances, indices = knn.kneighbors(uploaded_embedding.reshape(1, -1))
+            
+            # Get the top visually similar items from category matches
+            for i in range(min(len(indices[0]), top_n*2)):
+                idx = match_indices[indices[0][i]]
+                path = image_paths[idx]
+                # Get metadata for this path
+                metadata = {}  # Replace with actual metadata access
+                matching_items.append({
+                    'path': path,
+                    'metadata': metadata,
+                    'matchType': 'visual+category',
+                    'similarityScore': float(1.0 - distances[0][i])  # Convert distance to similarity score
+                })
+        
+        # Step 3: If we don't have enough visually similar items, add random category matches
+        if len(matching_items) < top_n and category_matches:
+            random.shuffle(category_matches)
+            for _, path, metadata in category_matches:
+                if len(matching_items) >= top_n:
+                    break
+                    
+                # Check if this item is already in the list
+                if not any(item['path'] == path for item in matching_items):
+                    matching_items.append({
+                        'path': path,
+                        'metadata': metadata,
+                        'matchType': 'category',
+                        'similarityScore': 0.0
+                    })
+    
+    # Step 4: If we still don't have enough items, add some random ones
+    if len(matching_items) < top_n and image_paths:
+        random_indices = random.sample(range(len(image_paths)), min(top_n*2, len(image_paths)))
+        for idx in random_indices:
+            path = image_paths[idx]
+            # Get metadata for this path
+            metadata = {}  # Replace with actual metadata access
+            
+            # Check if this item is already in the list
+            if len(matching_items) >= top_n:
+                break
+            if not any(item['path'] == path for item in matching_items):
+                matching_items.append({
+                    'path': path,
+                    'metadata': metadata,
+                    'matchType': 'random',
+                    'similarityScore': 0.0
+                })
+    
+    # Return top_n matching items
+    return matching_items[:top_n]
 
 # -----------------------------
 # Flask App Setup
@@ -250,7 +441,13 @@ def upload_image():
     try:
         pil_image = PIL.Image.open(BytesIO(image_content)).convert("RGB")
         uploaded_embedding = extract_features(pil_image)
-        matching_items = get_similar_items(uploaded_embedding, top_n=3)
+        matching_items = get_matching_items(
+            metrics['clothingType'],
+            metrics['clothingCategory'],
+            uploaded_embedding=uploaded_embedding,
+            top_n=3,
+            similarity_weight=0.3
+        )
     except Exception as e:
         logging.error(f"Mix-match processing failed: {e}")
         matching_items = []
