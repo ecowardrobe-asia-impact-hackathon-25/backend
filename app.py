@@ -306,7 +306,7 @@ def get_matching():
     
     # Build the matching items response
     response_data = {
-        'matchingItems': [item.to_dict() for item in matching_items]
+        'matchingItems': [item.to_dict() | {'id': item.id} for item in matching_items]
     }
 
     return jsonify(response_data), 200

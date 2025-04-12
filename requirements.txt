@@ -1,0 +1,6 @@
+dotenv==0.9.9
+firebase-admin==6.7.0
+Flask==3.1.0
+google-cloud-vision==3.10.1
+google-genai==1.10.0
+pillow==11.1.0
