@@ -205,14 +205,16 @@ app = Flask(__name__)
 def index():
     return "Enhanced Google Vision, Gemini & Mix-Match Fashion Backend is running."
 
+ANALYSIS_CACHE = {}
+
 @app.route('/upload', methods=['POST'])
 def upload_image():
     """
     1. Receives an image file via POST (multipart/form-data).
     2. Uses Google Cloud Vision API for label detection.
     3. Calls Gemini to compute sustainability metrics and additional clothing information.
-    4. Uses a mix-match algorithm (via ResNet feature extraction) to find similar items from the test_images folder.
-    5. Returns a JSON response containing both the detected labels, Gemini metrics, and matching items.
+    4. Caches the clothing category for later use.
+    5. Returns a JSON response containing the detected labels and Gemini metrics.
     """
     if 'file' not in request.files:
         return jsonify({'error': 'No file part in the request'}), 400
@@ -220,6 +222,8 @@ def upload_image():
     file = request.files['file']
     if not file or file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
+
+    filename = file.filename
 
     try:
         image_content = file.read()
@@ -247,27 +251,59 @@ def upload_image():
         logging.error(f"Gemini call failed: {e}")
         return jsonify({"error": f"Gemini call failed: {str(e)}"}), 500
 
-    # 3. Get matching items based on clothing category
+    # Store clothing category in cache for the matching endpoint
     clothing_category = metrics.get('clothingCategory', 'Unknown')
-    matching_items = get_matching_items(clothing_category)
-   
-    # Build the combined response
+    ANALYSIS_CACHE[filename] = clothing_category
+    
+    # Build the response (without matching items)
     response_data = {
         'labels': detected_labels,
         'gemini': {
             'clothingType': metrics.get('clothingType', 'Unknown'),
-            'clothingCategory': metrics.get('clothingCategory', 'Unknown'),
+            'clothingCategory': clothing_category,
             'material': metrics.get('material', 'Unknown'),
             'fabricComposition': metrics.get('fabricComposition', 'Unknown'),
             'longevityScore': metrics.get('longevityScore', 0),
             'co2Consumption': metrics.get('co2Consumption', 0),
             'sustainabilityScore': metrics.get('sustainabilityScore', 0),
             'maintenanceTips': metrics.get('maintenanceTips', 'No tips available'),
-        },
+        }
+    }
+
+    return jsonify(response_data), 200
+
+@app.route('/matching', methods=['POST'])
+def get_matching():
+    """
+    Uses the cached clothing category to return matching items
+    without reprocessing the image.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part in the request'}), 400
+
+    file = request.files['file']
+    if not file or file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    filename = file.filename
+    
+    # Check if we have this image's category in the cache
+    if filename not in ANALYSIS_CACHE:
+        return jsonify({'error': 'Please process this image with /upload endpoint first'}), 400
+        
+    # Get the clothing category from cache
+    clothing_category = ANALYSIS_CACHE[filename]
+    
+    # Get matching items based on cached clothing category
+    matching_items = get_matching_items(clothing_category)
+   
+    # Build the matching items response
+    response_data = {
         'matchingItems': matching_items
     }
 
     return jsonify(response_data), 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)
